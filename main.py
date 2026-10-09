@@ -4,8 +4,8 @@ import functions_framework
 import google.auth
 from google.auth.transport.requests import Request
 from google.oauth2 import id_token
-from google.cloud import aiplatform
-from google.cloud.aiplatform.generative_models import GenerativeModel
+import vertexai
+from vertexai.generative_models import GenerativeModel
 from mcp.client.sse import sse_client
 from mcp import ClientSession
 
@@ -26,7 +26,8 @@ def get_mcp_auth_token():
         raise
 
 async def perform_agent_work(user_prompt: str) -> str:
-    aiplatform.init(project=PROJECT_ID, location=LOCATION)
+    # Initialize Vertex AI
+    vertexai.init(project=PROJECT_ID, location=LOCATION)
     headers = get_mcp_auth_token()
     print(f"Connecting to Falcon MCP at {SSE_URL}...")
 
