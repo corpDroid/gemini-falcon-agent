@@ -9,7 +9,7 @@ from vertexai.generative_models import GenerativeModel
 from mcp.client.sse import sse_client
 from mcp import ClientSession
 
-FALCON_MCP_URL = "https://falcon-mcp-server-nbupl3xsea-el.a.run.app"
+FALCON_MCP_URL = "https://falcon-mcp-server-262878782932.asia-south1.run.app"
 SSE_URL = f"{FALCON_MCP_URL}/sse"
 PROJECT_ID = "gemini-enterprise-non-prod"
 LOCATION = "asia-south1"
