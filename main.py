@@ -14,33 +14,34 @@ from vertexai.generative_models import (
 from mcp.client.sse import sse_client
 from mcp import ClientSession
 
-# --- Patch httpx / httpx2 to automatically follow Cloud Run HTTPS redirects ---
-for mod_name in ("httpx", "httpx2"):
-    try:
-        mod = __import__(mod_name)
-        _orig_request = mod.AsyncClient.request
+# Import the HTTP client used by the MCP SDK
+try:
+    import httpx2 as mcp_http
+except ImportError:
+    import httpx as mcp_http
 
-        def _make_patched(orig):
-            async def _patched_request(self, method, url, *args, **kwargs):
-                kwargs["follow_redirects"] = True
-                url_str = str(url)
-                if url_str.startswith("http://falcon-mcp-server-"):
-                    url = url_str.replace("http://", "https://", 1)
-                
-                resp = await orig(self, method, url, *args, **kwargs)
-                
-                # If Cloud Run returns a 307 redirect pointing to http://, upgrade and follow it
-                if resp.status_code in (301, 302, 307, 308) and "location" in resp.headers:
-                    target = resp.headers["location"]
-                    if target.startswith("http://"):
-                        target = target.replace("http://", "https://", 1)
-                    resp = await self.request(method, target, *args, **kwargs)
-                return resp
-            return _patched_request
+# Custom HTTP client that automatically upgrades any Cloud Run redirect from HTTP to HTTPS
+class SecureRedirectClient(mcp_http.AsyncClient):
+    async def request(self, method, url, **kwargs):
+        kwargs["follow_redirects"] = True
+        url_str = str(url)
+        if url_str.startswith("http://falcon-mcp-server-"):
+            url = url_str.replace("http://", "https://", 1)
+        
+        response = await super().request(method, url, **kwargs)
+        
+        # If server returns a 307/308 redirect pointing to http://, rewrite to https:// and follow it
+        if response.status_code in (301, 302, 307, 308) and "location" in response.headers:
+            target = response.headers["location"]
+            if target.startswith("http://"):
+                target = target.replace("http://", "https://", 1)
+            response = await super().request(method, target, **kwargs)
+        return response
 
-        mod.AsyncClient.request = _make_patched(_orig_request)
-    except ImportError:
-        pass
+def custom_http_factory(**kwargs):
+    kwargs["follow_redirects"] = True
+    kwargs["timeout"] = mcp_http.Timeout(60.0, read=300.0)
+    return SecureRedirectClient(**kwargs)
 
 # --- Configuration ---
 FALCON_MCP_URL = "https://falcon-mcp-server-262878782932.asia-south1.run.app"
@@ -49,7 +50,6 @@ PROJECT_ID = "gemini-enterprise-non-prod"
 LOCATION = "asia-south1"
 
 def get_mcp_auth_token():
-    """Generates an identity token for service-to-service communication."""
     try:
         creds, _ = google.auth.default()
         auth_req = Request()
@@ -61,7 +61,6 @@ def get_mcp_auth_token():
         return {}
 
 def mcp_to_vertex_tools(mcp_tools):
-    """Converts MCP Tool schemas into Vertex AI FunctionDeclarations."""
     func_decls = []
     for t in mcp_tools:
         schema = t.inputSchema if hasattr(t, "inputSchema") and t.inputSchema else {"type": "object", "properties": {}}
@@ -80,12 +79,12 @@ def mcp_to_vertex_tools(mcp_tools):
     return [Tool(function_declarations=func_decls)] if func_decls else []
 
 async def perform_agent_work(user_prompt: str) -> str:
-    """Orchestrates tool discovery, Gemini reasoning, tool execution, and response synthesis."""
     vertexai.init(project=PROJECT_ID, location=LOCATION)
     headers = get_mcp_auth_token()
     print(f"Connecting to Falcon MCP at {SSE_URL}...")
 
-    async with sse_client(SSE_URL, headers=headers) as (read_stream, write_stream):
+    # Pass custom_http_factory into sse_client
+    async with sse_client(SSE_URL, headers=headers, httpx_client_factory=custom_http_factory) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
             print("MCP session initialized successfully.")
@@ -112,7 +111,7 @@ async def perform_agent_work(user_prompt: str) -> str:
             chat = model.start_chat()
             response = chat.send_message(user_prompt)
 
-            # 4. Check if Gemini decided to call a CrowdStrike tool
+            # 4. Check if Gemini invoked a tool
             first_candidate = response.candidates[0]
             function_calls = [part.function_call for part in first_candidate.content.parts if part.function_call]
 
@@ -122,13 +121,13 @@ async def perform_agent_work(user_prompt: str) -> str:
                 tool_args = dict(call.args)
                 print(f"Gemini requested tool: {tool_name} with arguments: {tool_args}")
 
-                # 5. Execute the tool on falcon-mcp-server
+                # 5. Execute tool against Falcon MCP
                 tool_result = await session.call_tool(tool_name, arguments=tool_args)
                 raw_result = [c.text for c in tool_result.content if hasattr(c, "text")]
                 result_str = "\n".join(raw_result) if raw_result else str(tool_result.content)
                 print(f"Tool execution returned: {result_str[:200]}...")
 
-                # 6. Send live result back to Gemini for final synthesis
+                # 6. Send result back to Gemini for final synthesis
                 final_response = chat.send_message(
                     Part.from_function_response(
                         name=tool_name,
