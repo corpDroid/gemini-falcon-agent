@@ -14,34 +14,37 @@ from vertexai.generative_models import (
 from mcp.client.sse import sse_client
 from mcp import ClientSession
 
-# Import the HTTP client used by the MCP SDK
+# Patch httpx2 in mcp.client.sse to prevent trailing-slash redirects
 try:
-    import httpx2 as mcp_http
-except ImportError:
-    import httpx as mcp_http
+    import httpx2
+    _orig_post = httpx2.AsyncClient.post
 
-# Custom HTTP client that automatically upgrades any Cloud Run redirect from HTTP to HTTPS
-class SecureRedirectClient(mcp_http.AsyncClient):
-    async def request(self, method, url, **kwargs):
+    async def _clean_post(self, url, *args, **kwargs):
         kwargs["follow_redirects"] = True
         url_str = str(url)
+        # Normalize /messages/ to /messages to prevent Starlette 307 redirects
+        if "/messages/?" in url_str:
+            url_str = url_str.replace("/messages/?", "/messages?")
+        elif url_str.endswith("/messages/"):
+            url_str = url_str[:-1]
+        
+        # Ensure scheme stays https
         if url_str.startswith("http://falcon-mcp-server-"):
-            url = url_str.replace("http://", "https://", 1)
-        
-        response = await super().request(method, url, **kwargs)
-        
-        # If server returns a 307/308 redirect pointing to http://, rewrite to https:// and follow it
-        if response.status_code in (301, 302, 307, 308) and "location" in response.headers:
-            target = response.headers["location"]
+            url_str = url_str.replace("http://", "https://", 1)
+            
+        resp = await _orig_post(self, url_str, *args, **kwargs)
+        if resp.status_code in (301, 302, 307, 308) and "location" in resp.headers:
+            target = resp.headers["location"]
             if target.startswith("http://"):
                 target = target.replace("http://", "https://", 1)
-            response = await super().request(method, target, **kwargs)
-        return response
+            if "/messages/?" in target:
+                target = target.replace("/messages/?", "/messages?")
+            resp = await _orig_post(self, target, *args, **kwargs)
+        return resp
 
-def custom_http_factory(**kwargs):
-    kwargs["follow_redirects"] = True
-    kwargs["timeout"] = mcp_http.Timeout(60.0, read=300.0)
-    return SecureRedirectClient(**kwargs)
+    httpx2.AsyncClient.post = _clean_post
+except ImportError:
+    pass
 
 # --- Configuration ---
 FALCON_MCP_URL = "https://falcon-mcp-server-262878782932.asia-south1.run.app"
@@ -83,8 +86,7 @@ async def perform_agent_work(user_prompt: str) -> str:
     headers = get_mcp_auth_token()
     print(f"Connecting to Falcon MCP at {SSE_URL}...")
 
-    # Pass custom_http_factory into sse_client
-    async with sse_client(SSE_URL, headers=headers, httpx_client_factory=custom_http_factory) as (read_stream, write_stream):
+    async with sse_client(SSE_URL, headers=headers) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
             print("MCP session initialized successfully.")
