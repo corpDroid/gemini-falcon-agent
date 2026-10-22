@@ -11,48 +11,16 @@ from vertexai.generative_models import (
     FunctionDeclaration,
     Part
 )
-from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamable_http_client
 from mcp import ClientSession
 
-# Patch httpx2 in mcp.client.sse to prevent trailing-slash redirects
-try:
-    import httpx2
-    _orig_post = httpx2.AsyncClient.post
-
-    async def _clean_post(self, url, *args, **kwargs):
-        kwargs["follow_redirects"] = True
-        url_str = str(url)
-        # Normalize /messages/ to /messages to prevent Starlette 307 redirects
-        if "/messages/?" in url_str:
-            url_str = url_str.replace("/messages/?", "/messages?")
-        elif url_str.endswith("/messages/"):
-            url_str = url_str[:-1]
-        
-        # Ensure scheme stays https
-        if url_str.startswith("http://falcon-mcp-server-"):
-            url_str = url_str.replace("http://", "https://", 1)
-            
-        resp = await _orig_post(self, url_str, *args, **kwargs)
-        if resp.status_code in (301, 302, 307, 308) and "location" in resp.headers:
-            target = resp.headers["location"]
-            if target.startswith("http://"):
-                target = target.replace("http://", "https://", 1)
-            if "/messages/?" in target:
-                target = target.replace("/messages/?", "/messages?")
-            resp = await _orig_post(self, target, *args, **kwargs)
-        return resp
-
-    httpx2.AsyncClient.post = _clean_post
-except ImportError:
-    pass
-
-# --- Configuration ---
 FALCON_MCP_URL = "https://falcon-mcp-server-262878782932.asia-south1.run.app"
-SSE_URL = f"{FALCON_MCP_URL}/sse"
+MCP_ENDPOINT = f"{FALCON_MCP_URL}/mcp"
 PROJECT_ID = "gemini-enterprise-non-prod"
 LOCATION = "asia-south1"
 
 def get_mcp_auth_token():
+    """Generates an identity token for service-to-service communication."""
     try:
         creds, _ = google.auth.default()
         auth_req = Request()
@@ -60,10 +28,11 @@ def get_mcp_auth_token():
         token = id_token.fetch_id_token(auth_req, FALCON_MCP_URL)
         return {"Authorization": f"Bearer {token}"}
     except Exception as exc:
-        print(f"Token note: {exc}")
+        print(f"Token generation note: {exc}")
         return {}
 
 def mcp_to_vertex_tools(mcp_tools):
+    """Converts MCP Tool schemas into Vertex AI FunctionDeclarations."""
     func_decls = []
     for t in mcp_tools:
         schema = t.inputSchema if hasattr(t, "inputSchema") and t.inputSchema else {"type": "object", "properties": {}}
@@ -82,16 +51,18 @@ def mcp_to_vertex_tools(mcp_tools):
     return [Tool(function_declarations=func_decls)] if func_decls else []
 
 async def perform_agent_work(user_prompt: str) -> str:
+    """Orchestrates tool discovery, Gemini reasoning, tool execution, and response synthesis."""
     vertexai.init(project=PROJECT_ID, location=LOCATION)
     headers = get_mcp_auth_token()
-    print(f"Connecting to Falcon MCP at {SSE_URL}...")
+    print(f"Connecting to Falcon MCP at {MCP_ENDPOINT}...")
 
-    async with sse_client(SSE_URL, headers=headers) as (read_stream, write_stream):
+    
+    async with streamable_http_client(MCP_ENDPOINT, headers=headers) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
             print("MCP session initialized successfully.")
 
-            # 1. Fetch live tool definitions from Falcon MCP
+            
             tools_resp = await session.list_tools()
             vertex_tools = mcp_to_vertex_tools(tools_resp.tools)
             print(f"Discovered {len(tools_resp.tools)} tools from Falcon MCP.")
@@ -102,18 +73,18 @@ async def perform_agent_work(user_prompt: str) -> str:
                 "Always present findings clearly with relevant counts, hostnames, and risk levels."
             )
 
-            # 2. Initialize Gemini with native tools
+            
             model = GenerativeModel(
                 "gemini-1.5-flash-001",
                 system_instruction=[system_instruction],
                 tools=vertex_tools
             )
 
-            # 3. Start chat session and send prompt
+            
             chat = model.start_chat()
             response = chat.send_message(user_prompt)
 
-            # 4. Check if Gemini invoked a tool
+            
             first_candidate = response.candidates[0]
             function_calls = [part.function_call for part in first_candidate.content.parts if part.function_call]
 
@@ -123,13 +94,12 @@ async def perform_agent_work(user_prompt: str) -> str:
                 tool_args = dict(call.args)
                 print(f"Gemini requested tool: {tool_name} with arguments: {tool_args}")
 
-                # 5. Execute tool against Falcon MCP
                 tool_result = await session.call_tool(tool_name, arguments=tool_args)
                 raw_result = [c.text for c in tool_result.content if hasattr(c, "text")]
                 result_str = "\n".join(raw_result) if raw_result else str(tool_result.content)
                 print(f"Tool execution returned: {result_str[:200]}...")
 
-                # 6. Send result back to Gemini for final synthesis
+                
                 final_response = chat.send_message(
                     Part.from_function_response(
                         name=tool_name,
