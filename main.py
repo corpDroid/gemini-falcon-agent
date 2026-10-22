@@ -14,6 +14,34 @@ from vertexai.generative_models import (
 from mcp.client.sse import sse_client
 from mcp import ClientSession
 
+# --- Patch httpx / httpx2 to automatically follow Cloud Run HTTPS redirects ---
+for mod_name in ("httpx", "httpx2"):
+    try:
+        mod = __import__(mod_name)
+        _orig_request = mod.AsyncClient.request
+
+        def _make_patched(orig):
+            async def _patched_request(self, method, url, *args, **kwargs):
+                kwargs["follow_redirects"] = True
+                url_str = str(url)
+                if url_str.startswith("http://falcon-mcp-server-"):
+                    url = url_str.replace("http://", "https://", 1)
+                
+                resp = await orig(self, method, url, *args, **kwargs)
+                
+                # If Cloud Run returns a 307 redirect pointing to http://, upgrade and follow it
+                if resp.status_code in (301, 302, 307, 308) and "location" in resp.headers:
+                    target = resp.headers["location"]
+                    if target.startswith("http://"):
+                        target = target.replace("http://", "https://", 1)
+                    resp = await self.request(method, target, *args, **kwargs)
+                return resp
+            return _patched_request
+
+        mod.AsyncClient.request = _make_patched(_orig_request)
+    except ImportError:
+        pass
+
 # --- Configuration ---
 FALCON_MCP_URL = "https://falcon-mcp-server-262878782932.asia-south1.run.app"
 SSE_URL = f"{FALCON_MCP_URL}/sse"
@@ -21,7 +49,7 @@ PROJECT_ID = "gemini-enterprise-non-prod"
 LOCATION = "asia-south1"
 
 def get_mcp_auth_token():
-    """Generates an identity token for service-to-service communication if needed."""
+    """Generates an identity token for service-to-service communication."""
     try:
         creds, _ = google.auth.default()
         auth_req = Request()
@@ -29,23 +57,19 @@ def get_mcp_auth_token():
         token = id_token.fetch_id_token(auth_req, FALCON_MCP_URL)
         return {"Authorization": f"Bearer {token}"}
     except Exception as exc:
-        print(f"Token generation note: {exc}")
+        print(f"Token note: {exc}")
         return {}
 
 def mcp_to_vertex_tools(mcp_tools):
     """Converts MCP Tool schemas into Vertex AI FunctionDeclarations."""
     func_decls = []
     for t in mcp_tools:
-        # Extract schema properties and required fields
         schema = t.inputSchema if hasattr(t, "inputSchema") and t.inputSchema else {"type": "object", "properties": {}}
-        
-        # Clean schema for Vertex AI compatibility
         clean_schema = {
             "type": "object",
             "properties": schema.get("properties", {}),
             "required": schema.get("required", [])
         }
-        
         func_decls.append(
             FunctionDeclaration(
                 name=t.name,
@@ -64,7 +88,7 @@ async def perform_agent_work(user_prompt: str) -> str:
     async with sse_client(SSE_URL, headers=headers) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
-            print("MCP session initialized.")
+            print("MCP session initialized successfully.")
 
             # 1. Fetch live tool definitions from Falcon MCP
             tools_resp = await session.list_tools()
@@ -113,7 +137,6 @@ async def perform_agent_work(user_prompt: str) -> str:
                 )
                 return final_response.text
 
-            # If Gemini answered directly without needing a tool
             return response.text
 
 @functions_framework.http
