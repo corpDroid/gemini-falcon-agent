@@ -1,7 +1,9 @@
 import asyncio
 import json
 import functions_framework
-import google.auth
+import google.au
+
+th
 from google.auth.transport.requests import Request
 from google.oauth2 import id_token
 import vertexai
@@ -14,6 +16,13 @@ from vertexai.generative_models import (
 from mcp.client.streamable_http import streamable_http_client
 from mcp import ClientSession
 
+# Import httpx2 (used by MCP SDK v2) with fallback to httpx
+try:
+    import httpx2
+except ImportError:
+    import httpx as httpx2
+
+# --- Configuration ---
 FALCON_MCP_URL = "https://falcon-mcp-server-262878782932.asia-south1.run.app"
 MCP_ENDPOINT = f"{FALCON_MCP_URL}/mcp"
 PROJECT_ID = "gemini-enterprise-non-prod"
@@ -56,59 +65,61 @@ async def perform_agent_work(user_prompt: str) -> str:
     headers = get_mcp_auth_token()
     print(f"Connecting to Falcon MCP at {MCP_ENDPOINT}...")
 
-    
-    async with streamable_http_client(MCP_ENDPOINT, headers=headers) as (read_stream, write_stream):
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
-            print("MCP session initialized successfully.")
+    # Pass headers via http_client as required by MCP SDK v2
+    async with httpx2.AsyncClient(headers=headers, timeout=httpx2.Timeout(30.0, read=300.0)) as http_client:
+        async with streamable_http_client(MCP_ENDPOINT, http_client=http_client) as (read_stream, write_stream, *_):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                print("MCP session initialized successfully.")
 
-            
-            tools_resp = await session.list_tools()
-            vertex_tools = mcp_to_vertex_tools(tools_resp.tools)
-            print(f"Discovered {len(tools_resp.tools)} tools from Falcon MCP.")
+                # 1. Fetch live tool definitions from Falcon MCP
+                tools_resp = await session.list_tools()
+                vertex_tools = mcp_to_vertex_tools(tools_resp.tools)
+                print(f"Discovered {len(tools_resp.tools)} tools from Falcon MCP.")
 
-            system_instruction = (
-                "You are an enterprise SecOps assistant with real-time access to CrowdStrike Falcon tools. "
-                "Use the available tools to query devices, investigate detections, and inspect security telemetry. "
-                "Always present findings clearly with relevant counts, hostnames, and risk levels."
-            )
-
-            
-            model = GenerativeModel(
-                "gemini-1.5-flash-001",
-                system_instruction=[system_instruction],
-                tools=vertex_tools
-            )
-
-            
-            chat = model.start_chat()
-            response = chat.send_message(user_prompt)
-
-            
-            first_candidate = response.candidates[0]
-            function_calls = [part.function_call for part in first_candidate.content.parts if part.function_call]
-
-            if function_calls:
-                call = function_calls[0]
-                tool_name = call.name
-                tool_args = dict(call.args)
-                print(f"Gemini requested tool: {tool_name} with arguments: {tool_args}")
-
-                tool_result = await session.call_tool(tool_name, arguments=tool_args)
-                raw_result = [c.text for c in tool_result.content if hasattr(c, "text")]
-                result_str = "\n".join(raw_result) if raw_result else str(tool_result.content)
-                print(f"Tool execution returned: {result_str[:200]}...")
-
-                
-                final_response = chat.send_message(
-                    Part.from_function_response(
-                        name=tool_name,
-                        response={"content": result_str}
-                    )
+                system_instruction = (
+                    "You are an enterprise SecOps assistant with real-time access to CrowdStrike Falcon tools. "
+                    "Use the available tools to query devices, investigate detections, and inspect security telemetry. "
+                    "Always present findings clearly with relevant counts, hostnames, and risk levels."
                 )
-                return final_response.text
 
-            return response.text
+                # 2. Initialize Gemini with native tools
+                model = GenerativeModel(
+                    "gemini-1.5-flash-001",
+                    system_instruction=[system_instruction],
+                    tools=vertex_tools
+                )
+
+                # 3. Start chat session and send prompt
+                chat = model.start_chat()
+                response = chat.send_message(user_prompt)
+
+                # 4. Check if Gemini invoked a tool
+                first_candidate = response.candidates[0]
+                function_calls = [part.function_call for part in first_candidate.content.parts if part.function_call]
+
+                if function_calls:
+                    call = function_calls[0]
+                    tool_name = call.name
+                    tool_args = dict(call.args)
+                    print(f"Gemini requested tool: {tool_name} with arguments: {tool_args}")
+
+                    # 5. Execute tool against Falcon MCP
+                    tool_result = await session.call_tool(tool_name, arguments=tool_args)
+                    raw_result = [c.text for c in tool_result.content if hasattr(c, "text")]
+                    result_str = "\n".join(raw_result) if raw_result else str(tool_result.content)
+                    print(f"Tool execution returned: {result_str[:200]}...")
+
+                    # 6. Send result back to Gemini for final synthesis
+                    final_response = chat.send_message(
+                        Part.from_function_response(
+                            name=tool_name,
+                            response={"content": result_str}
+                        )
+                    )
+                    return final_response.text
+
+                return response.text
 
 @functions_framework.http
 def gemini_falcon_agent(request):
